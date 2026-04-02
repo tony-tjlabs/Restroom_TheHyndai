@@ -96,7 +96,7 @@ def generate_insights(metrics: dict) -> dict[str, str]:
 
     try:
         resp = client.messages.create(
-            model=MODEL, max_tokens=600,
+            model=MODEL, max_tokens=1024,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
         )
