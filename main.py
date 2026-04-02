@@ -1,5 +1,7 @@
 """더현대서울 화장실 이용 모니터링 대시보드 (배포 버전)."""
 
+import json
+
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -14,13 +16,14 @@ from src.metrics import (
     compute_peak_analysis,
     compute_daily_comparison,
 )
+from src.llm_insights import (
+    generate_insights,
+    generate_comparison_insights,
+    build_metrics_for_llm,
+)
 
 # ─── 페이지 설정 ────────────────────────────────────────────
-st.set_page_config(
-    page_title="화장실 이용 모니터링",
-    page_icon="🚻",
-    layout="wide",
-)
+st.set_page_config(page_title="화장실 이용 모니터링", page_icon="🚻", layout="wide")
 
 # ─── 상수 ────────────────────────────────────────────────────
 COLORS = {"남자화장실": "#4A90D9", "여자화장실": "#E85D75"}
@@ -28,16 +31,16 @@ MALE_FILL = "rgba(74,144,217,0.1)"
 FEMALE_FILL = "rgba(232,93,117,0.1)"
 BG = "#0E1117"
 GRID = "#1a2035"
-# Plotly 렌더 최적화: 불필요한 모드바 제거
-PLOTLY_CFG = {"displayModeBar": False}
+PCFG = {"displayModeBar": False}
 
-# ─── 스타일 (한 번만 주입) ────────────────────────────────────
+# ─── 스타일 ──────────────────────────────────────────────────
 st.markdown("""<style>
 .mc{background:linear-gradient(135deg,#1a1f36,#252b48);border-radius:12px;padding:20px;text-align:center;border:1px solid #2d3456}
 .mv{font-size:2.2rem;font-weight:700;color:#FFF;margin:4px 0}
 .ml{font-size:.85rem;color:#8892b0;text-transform:uppercase;letter-spacing:.5px}
 .ms{font-size:.75rem;color:#5a6785;margin-top:4px}
 .sh{font-size:1.1rem;font-weight:600;color:#ccd6f6;margin:24px 0 12px;padding-bottom:8px;border-bottom:1px solid #2d3456}
+.ai{background:linear-gradient(135deg,#1a2332,#1e2d3d);border-left:3px solid #64ffda;border-radius:8px;padding:14px 18px;margin:10px 0;font-size:.88rem;color:#b8c9e0;line-height:1.6}
 </style>""", unsafe_allow_html=True)
 
 
@@ -50,7 +53,7 @@ def sh(text: str):
     st.markdown(f'<div class="sh">{text}</div>', unsafe_allow_html=True)
 
 
-def _layout(title: str = "", height: int = 400) -> dict:
+def _lay(title: str = "", height: int = 400) -> dict:
     return dict(
         title=dict(text=title, font=dict(size=14, color="#ccd6f6")),
         paper_bgcolor=BG, plot_bgcolor=BG,
@@ -76,7 +79,7 @@ if not st.session_state.auth:
     st.caption("더현대서울 1F")
     pw = st.text_input("비밀번호를 입력하세요", type="password")
     if pw:
-        if pw == st.secrets.get("password", "wonderful2$"):
+        if pw == st.secrets.get("password", ""):
             st.session_state.auth = True
             st.rerun()
         else:
@@ -118,6 +121,11 @@ def _filter(date_str: str, t0: int, t1: int):
     return visits, occ, ft
 
 
+@st.cache_data(show_spinner=False, ttl=3600)
+def _ai(metrics_json: str) -> dict:
+    return generate_insights(json.loads(metrics_json))
+
+
 # ═══════════════════════════════════════════════════════════
 #  일별 분석 모드
 # ═══════════════════════════════════════════════════════════
@@ -128,6 +136,10 @@ if view_mode == "일별 분석":
     if visits.empty:
         st.warning("해당 날짜/시간대에 방문 기록이 없습니다.")
         st.stop()
+
+    # 남녀 분리 (재사용)
+    v_male = visits[visits["restroom"] == "남자화장실"]
+    v_female = visits[visits["restroom"] == "여자화장실"]
 
     # ─── 요약 메트릭 ────────────────────────────────────
     summary = compute_summary(visits, occupancy)
@@ -140,10 +152,6 @@ if view_mode == "일별 분석":
     st.markdown("")
 
     # ─── 남녀별 요약 ────────────────────────────────────
-    # 미리 남녀 분리 (재사용)
-    v_male = visits[visits["restroom"] == "남자화장실"]
-    v_female = visits[visits["restroom"] == "여자화장실"]
-
     col_m, col_f = st.columns(2)
     for col, label, rv, icon in [
         (col_m, "남자화장실", v_male, "🚹"),
@@ -180,16 +188,13 @@ if view_mode == "일별 분석":
             users = rv["mac_address"].nunique() if not rv.empty else 0
             rate = (users / total_passerby * 100) if total_passerby > 0 else 0
             flow_rows.append({
-                "화장실": label,
-                "이용자": f"{users:,}",
-                "이용률": f"{rate:.1f}%",
+                "화장실": label, "이용자": f"{users:,}", "이용률": f"{rate:.1f}%",
                 "평균 체류": f"{rv['duration_min'].mean():.1f}분" if not rv.empty else "0분",
                 "총 방문": f"{len(rv):,}",
             })
         st.dataframe(pd.DataFrame(flow_rows), hide_index=True, use_container_width=True)
 
     with col_device:
-        # iPhone vs Android (이용자 기준)
         if "device_type" in visits.columns:
             dev_counts = visits["device_type"].value_counts()
             iph = int(dev_counts.get("iPhone", 0))
@@ -202,11 +207,11 @@ if view_mode == "일별 분석":
             marker=dict(colors=["#007AFF", "#3DDC84"]),
             textinfo="label+percent", textfont=dict(size=13), hole=0.45,
         ))
-        lay = _layout("iPhone vs Android (이용자)", 280)
+        lay = _lay("iPhone vs Android (이용자)", 280)
         lay.pop("xaxis", None); lay.pop("yaxis", None)
         fig.update_layout(**lay, showlegend=False,
             annotations=[dict(text=f"{total_dev:,}", x=0.5, y=0.5, font_size=20, font_color="#ccd6f6", showarrow=False)])
-        st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CFG)
+        st.plotly_chart(fig, use_container_width=True, config=PCFG)
 
     # ─── 시간대별 방문 추이 ─────────────────────────────
     sh("시간대별 방문 추이")
@@ -215,8 +220,8 @@ if view_mode == "일별 분석":
         fig = px.bar(hourly, x="hour_label", y="visit_count", color="restroom",
                      barmode="group", color_discrete_map=COLORS,
                      labels={"hour_label": "시간", "visit_count": "방문 횟수", "restroom": ""})
-        fig.update_layout(**_layout("시간대별 방문 횟수"))
-        st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CFG)
+        fig.update_layout(**_lay("시간대별 방문 횟수"))
+        st.plotly_chart(fig, use_container_width=True, config=PCFG)
 
     # ─── 동시 이용자 수 ───────────────────────────────
     sh("시간대별 동시 이용자 수 (1분 단위)")
@@ -233,9 +238,9 @@ if view_mode == "일별 분석":
                 customdata=tl, hovertemplate="%{customdata} | %{y}명<extra>%{fullData.name}</extra>"))
         tv = [h * 360 for h in range(time_range[0], time_range[1] + 1)]
         tt = [f"{h:02d}:00" for h in range(time_range[0], time_range[1] + 1)]
-        fig.update_layout(**_layout("동시 이용자 수 추이 (1분 단위)", 350))
+        fig.update_layout(**_lay("동시 이용자 수 추이 (1분 단위)", 350))
         fig.update_xaxes(tickmode="array", tickvals=tv, ticktext=tt)
-        st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CFG)
+        st.plotly_chart(fig, use_container_width=True, config=PCFG)
 
     # ─── 체류 시간 분포 ─────────────────────────────────
     sh("체류 시간 분포")
@@ -256,8 +261,8 @@ if view_mode == "일별 분석":
                          barmode="group", color_discrete_map=COLORS, text="label",
                          labels={"duration_bin": "체류 시간", "count": "방문 수", "restroom": ""})
             fig.update_traces(textposition="outside", textfont_size=10)
-            fig.update_layout(**_layout("체류 시간 분포", 400))
-            st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CFG)
+            fig.update_layout(**_lay("체류 시간 분포", 400))
+            st.plotly_chart(fig, use_container_width=True, config=PCFG)
         with c2:
             rows = []
             for label, rv in [("남자화장실", v_male), ("여자화장실", v_female)]:
@@ -280,10 +285,10 @@ if view_mode == "일별 분석":
             if pr.empty: continue
             fig.add_trace(go.Bar(x=pr["half_hour_label"], y=pr["visit_count"], name=r, marker_color=COLORS[r], showlegend=True), row=1, col=1)
             fig.add_trace(go.Bar(x=pr["half_hour_label"], y=pr["avg_duration_min"], name=r, marker_color=COLORS[r], showlegend=False), row=1, col=2)
-        lay = _layout(height=380); lay.pop("xaxis", None); lay.pop("yaxis", None)
+        lay = _lay(height=380); lay.pop("xaxis", None); lay.pop("yaxis", None)
         fig.update_layout(**lay)
         fig.update_xaxes(gridcolor=GRID); fig.update_yaxes(gridcolor=GRID)
-        st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CFG)
+        st.plotly_chart(fig, use_container_width=True, config=PCFG)
 
     # ─── AST 히트맵 ─────────────────────────────────────
     sh("시간대별 누적 체류 시간 (AST)")
@@ -291,8 +296,8 @@ if view_mode == "일별 분석":
         hm = hourly.pivot_table(index="restroom", columns="hour_label", values="total_ast_min", fill_value=0)
         fig = px.imshow(hm.values, x=hm.columns.tolist(), y=hm.index.tolist(),
                         color_continuous_scale="YlOrRd", labels=dict(x="시간", y="화장실", color="AST (분)"), aspect="auto")
-        fig.update_layout(**_layout("AST 히트맵 (분)", 250))
-        st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CFG)
+        fig.update_layout(**_lay("AST 히트맵 (분)", 250))
+        st.plotly_chart(fig, use_container_width=True, config=PCFG)
 
     # ─── 누적 체류 시간 추이 (벡터화) ─────────────────────
     sh("누적 체류 시간 추이 (AST)")
@@ -313,10 +318,10 @@ if view_mode == "일별 분석":
                 customdata=tl, hovertemplate="%{customdata} | %{y:.1f}분<extra>%{fullData.name}</extra>"))
         tv = [h * 360 for h in range(time_range[0], time_range[1] + 1)]
         tt = [f"{h:02d}:00" for h in range(time_range[0], time_range[1] + 1)]
-        fig.update_layout(**_layout("시간에 따른 누적 체류 시간 (분)", 380))
+        fig.update_layout(**_lay("시간에 따른 누적 체류 시간 (분)", 380))
         fig.update_xaxes(tickmode="array", tickvals=tv, ticktext=tt)
         fig.update_yaxes(title_text="누적 AST (분)")
-        st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CFG)
+        st.plotly_chart(fig, use_container_width=True, config=PCFG)
 
     # ─── 분류 신뢰도 ──────────────────────────────────────
     sh("남녀 분류 신뢰도")
@@ -326,8 +331,8 @@ if view_mode == "일별 분석":
             fig = px.histogram(visits, x="win_rate", color="restroom", nbins=20,
                                color_discrete_map=COLORS, barmode="overlay", opacity=0.7,
                                labels={"win_rate": "H2H 승률", "count": "방문 수", "restroom": ""})
-            fig.update_layout(**_layout("분류 승률 분포", 300))
-            st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CFG)
+            fig.update_layout(**_lay("분류 승률 분포", 300))
+            st.plotly_chart(fig, use_container_width=True, config=PCFG)
         with c2:
             if "classify_method" in visits.columns:
                 mc_data = visits["classify_method"].value_counts()
@@ -336,9 +341,9 @@ if view_mode == "일별 분석":
                     labels=[ml.get(m, m) for m in mc_data.index], values=mc_data.values,
                     hole=0.4, marker=dict(colors=["#64ffda", "#ffd166", "#a78bfa"]),
                     textinfo="label+percent", textfont=dict(size=11)))
-                lay = _layout("분류 방법 비율", 300); lay.pop("xaxis", None); lay.pop("yaxis", None)
+                lay = _lay("분류 방법 비율", 300); lay.pop("xaxis", None); lay.pop("yaxis", None)
                 fig.update_layout(**lay, showlegend=False)
-                st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CFG)
+                st.plotly_chart(fig, use_container_width=True, config=PCFG)
             conf = []
             for label, rv in [("남자화장실", v_male), ("여자화장실", v_female)]:
                 if not rv.empty:
@@ -353,15 +358,45 @@ if view_mode == "일별 분석":
         dcols = [c for c in ["restroom", "start_time", "end_time", "duration_min", "device_type", "win_rate", "classify_method", "mac_address"] if c in visits.columns]
         st.dataframe(visits[dcols].sort_values("start_time"), use_container_width=True, height=400)
 
+    # ─── AI Analysis ──────────────────────────────────────
+    st.markdown("---")
+    sh("🤖 AI Analysis")
+    st.caption("Claude AI가 오늘의 화장실 이용 데이터를 종합 분석합니다.")
+
+    if st.button("AI 분석 실행", type="primary", use_container_width=True):
+        with st.spinner("AI가 데이터를 분석하고 있습니다..."):
+            llm_m = build_metrics_for_llm(visits, occupancy, ft, selected_date, time_range)
+            ai = _ai(json.dumps(llm_m, default=str))
+
+        if ai:
+            titles = {
+                "summary": "📊 종합 요약",
+                "gender": "🚻 남녀 이용 패턴",
+                "peak": "⏰ 피크 시간대 & 혼잡도",
+                "duration": "⏱️ 체류 시간 분석",
+                "occupancy": "👥 동시 이용 & 용량",
+            }
+            for key, title in titles.items():
+                text = ai.get(key, "")
+                if text:
+                    st.markdown(
+                        f'<div class="ai"><span style="color:#64ffda;font-weight:600">{title}</span><br>{text}</div>',
+                        unsafe_allow_html=True,
+                    )
+        else:
+            st.warning("AI 분석을 실행할 수 없습니다. API 키를 확인해주세요.")
+
 # ═══════════════════════════════════════════════════════════
 #  날짜 비교 모드
 # ═══════════════════════════════════════════════════════════
 else:
     st.markdown("## 날짜별 비교 분석")
-    all_visits = {}
+    all_visits, all_occ, all_ft = {}, {}, {}
     for date in dates:
-        v, o, ft = _filter(date, time_range[0], time_range[1])
+        v, o, f = _filter(date, time_range[0], time_range[1])
         all_visits[date] = v
+        all_occ[date] = o
+        all_ft[date] = f
 
     comparison = compute_daily_comparison(all_visits)
     if comparison.empty:
@@ -383,8 +418,8 @@ else:
         fig.add_trace(go.Scatter(
             x=h["start_hour"].apply(lambda x: f"{int(x):02d}:00"), y=h["count"],
             mode="lines+markers", name=date, line=dict(color=dc[i % len(dc)], width=2)))
-    fig.update_layout(**_layout("날짜별 시간대 방문 비교"))
-    st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CFG)
+    fig.update_layout(**_lay("날짜별 시간대 방문 비교"))
+    st.plotly_chart(fig, use_container_width=True, config=PCFG)
 
     sh("날짜별 남녀 방문 비율")
     rd = []
@@ -396,13 +431,36 @@ else:
         fig = px.bar(pd.DataFrame(rd), x="date", y="count", color="restroom",
                      barmode="group", color_discrete_map=COLORS,
                      labels={"date": "날짜", "count": "방문 횟수", "restroom": ""})
-        fig.update_layout(**_layout("남녀 방문 비교", 350))
-        st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CFG)
+        fig.update_layout(**_lay("남녀 방문 비교", 350))
+        st.plotly_chart(fig, use_container_width=True, config=PCFG)
 
     sh("날짜별 체류 시간 분포")
     av = pd.concat([v.assign(date=d) for d, v in all_visits.items() if not v.empty], ignore_index=True)
     if not av.empty:
         fig = px.box(av, x="date", y="duration_min", color="restroom", color_discrete_map=COLORS,
                      labels={"date": "날짜", "duration_min": "체류 시간(분)", "restroom": ""})
-        fig.update_layout(**_layout("체류 시간 분포 비교", 400))
-        st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CFG)
+        fig.update_layout(**_lay("체류 시간 분포 비교", 400))
+        st.plotly_chart(fig, use_container_width=True, config=PCFG)
+
+    # ─── AI Analysis (비교 모드) ──────────────────────────
+    st.markdown("---")
+    sh("🤖 AI Analysis")
+    st.caption("Claude AI가 날짜 간 이용 패턴 변화를 분석합니다.")
+
+    if st.button("AI 비교 분석 실행", type="primary", use_container_width=True):
+        with st.spinner("AI가 데이터를 분석하고 있습니다..."):
+            daily_summaries = []
+            for date, v in all_visits.items():
+                if v.empty: continue
+                daily_summaries.append(
+                    build_metrics_for_llm(v, all_occ.get(date, pd.DataFrame()), all_ft.get(date, {}), date, time_range)
+                )
+            result = generate_comparison_insights(daily_summaries) if daily_summaries else ""
+
+        if result:
+            st.markdown(
+                f'<div class="ai"><span style="color:#64ffda;font-weight:600">📊 날짜 비교 종합 분석</span><br>{result}</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.warning("AI 분석을 실행할 수 없습니다. API 키를 확인해주세요.")
