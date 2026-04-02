@@ -5,6 +5,7 @@ Streamlit secrets에서 API 키를 로드.
 
 import logging
 
+import pandas as pd
 import anthropic
 import streamlit as st
 
@@ -13,6 +14,17 @@ logger = logging.getLogger(__name__)
 _client = None
 
 MODEL = "claude-sonnet-4-20250514"
+
+
+def _format_hourly_ft(hft: dict) -> str:
+    """시간대별 유동인구 dict → 프롬프트용 텍스트."""
+    if not hft:
+        return "- 데이터 없음"
+    lines = []
+    for h in sorted(hft.keys()):
+        lines.append(f"  {int(h):02d}시: {hft[h]:,}명")
+    return "\n".join(lines)
+
 
 SYSTEM_PROMPT = """당신은 백화점 화장실 이용 데이터를 분석하는 시설 운영 전문가입니다.
 
@@ -76,6 +88,11 @@ def generate_insights(metrics: dict) -> dict[str, str]:
 - 남자 AST: {metrics.get('male_ast_hours', 0):.1f}시간
 - 여자 AST: {metrics.get('female_ast_hours', 0):.1f}시간
 
+[시간대별 유동인구 (백화점 방문 패턴)]
+{_format_hourly_ft(metrics.get('hourly_foot_traffic', {}))}
+※ 유동인구는 화장실 앞을 지나간 전체 통행량으로, 백화점 방문객의 시간대별 유입 패턴을 반영합니다.
+  화장실 이용 피크와 유동인구 피크의 차이, 이용률 변화 등을 분석해주세요.
+
 아래 5개 섹션에 대해 각각 1~2문장의 인사이트를 작성하세요.
 반드시 아래 형식을 지켜주세요:
 
@@ -115,28 +132,44 @@ def generate_comparison_insights(daily_summaries: list[dict]) -> str:
         return ""
 
     lines = []
+    ft_lines = []
     for d in daily_summaries:
         lines.append(
             f"- {d.get('date', '?')}: "
+            f"유동인구 {d.get('foot_traffic', 0):,}명, "
             f"남 {d.get('male_users', 0)}명 / 여 {d.get('female_users', 0)}명, "
-            f"총 {d.get('total_users', 0)}명, "
+            f"총 {d.get('total_users', 0)}명 (이용률 {d.get('usage_rate', 0):.1f}%), "
             f"남 평균 {d.get('male_avg_min', 0):.1f}분 / 여 평균 {d.get('female_avg_min', 0):.1f}분, "
             f"피크 {d.get('peak_hour', 0)}시({d.get('peak_hour_visits', 0)}회)"
         )
+        hft = d.get("hourly_foot_traffic", {})
+        if hft:
+            top3 = sorted(hft.items(), key=lambda x: x[1], reverse=True)[:3]
+            top_str = ", ".join([f"{int(h):02d}시 {c:,}명" for h, c in top3])
+            ft_lines.append(f"  {d.get('date', '?')} 유동인구 Top3: {top_str}")
+
+    data_block = "\n".join(lines)
+    ft_block = "\n".join(ft_lines) if ft_lines else "  데이터 없음"
 
     prompt = f"""아래는 백화점 1F 화장실의 여러 날짜 이용 데이터 요약입니다.
 
-{chr(10).join(lines)}
+[날짜별 이용 현황]
+{data_block}
+
+[시간대별 유동인구 피크 (백화점 방문 패턴)]
+{ft_block}
+※ 유동인구는 화장실 앞 통행량으로, 백화점 전체 방문객 유입 패턴을 반영합니다.
+  날짜별 유동인구 차이와 화장실 이용률 변화의 상관관계도 분석해주세요.
 
 날짜 간 비교 인사이트를 3~5문장으로 작성하세요.
-- 날짜별 차이점, 트렌드
-- 요일/시간대 패턴 변화
-- 청소 주기, 인력 배치 등 시설 관리 관점의 제안
+- 날짜별 유동인구 패턴 차이와 화장실 이용률 변화
+- 요일/시간대별 백화점 방문 트렌드
+- 유동인구 대비 이용률 개선 또는 운영 최적화 제안
 마크다운 서식 사용 금지, 순수 텍스트로만."""
 
     try:
         resp = client.messages.create(
-            model=MODEL, max_tokens=400,
+            model=MODEL, max_tokens=600,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -146,13 +179,24 @@ def generate_comparison_insights(daily_summaries: list[dict]) -> str:
         return ""
 
 
-def build_metrics_for_llm(visits, occupancy, foot_traffic, date_str, time_range) -> dict:
+def build_metrics_for_llm(
+    visits, occupancy, foot_traffic, date_str, time_range,
+    hourly_foot_traffic=None,
+) -> dict:
     """대시보드 데이터에서 LLM용 메트릭 딕셔너리 구성."""
     m = {
         "date": date_str,
         "time_range": f"{time_range[0]}~{time_range[1]}시",
         "foot_traffic": foot_traffic.get("total_unique", 0) if isinstance(foot_traffic, dict) else 0,
     }
+
+    # 시간대별 유동인구
+    if hourly_foot_traffic is not None:
+        if isinstance(hourly_foot_traffic, pd.DataFrame) and not hourly_foot_traffic.empty:
+            hft = hourly_foot_traffic.set_index("hour")["unique_count"].to_dict()
+            m["hourly_foot_traffic"] = {int(k): int(v) for k, v in hft.items()}
+        elif isinstance(hourly_foot_traffic, dict):
+            m["hourly_foot_traffic"] = hourly_foot_traffic
 
     if visits.empty:
         return m

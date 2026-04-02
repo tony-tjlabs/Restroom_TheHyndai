@@ -365,7 +365,9 @@ if view_mode == "일별 분석":
 
     if st.button("AI 분석 실행", type="primary", use_container_width=True):
         with st.spinner("AI가 데이터를 분석하고 있습니다..."):
-            llm_m = build_metrics_for_llm(visits, occupancy, ft, selected_date, time_range)
+            _hft = load_hourly_foot_traffic(selected_date)
+            _hft = _hft[(_hft["hour"] >= time_range[0]) & (_hft["hour"] < time_range[1])] if not _hft.empty else _hft
+            llm_m = build_metrics_for_llm(visits, occupancy, ft, selected_date, time_range, hourly_foot_traffic=_hft)
             ai = _ai(json.dumps(llm_m, default=str))
 
         if ai:
@@ -472,8 +474,10 @@ else:
             daily_summaries = []
             for date, v in all_visits.items():
                 if v.empty: continue
+                _hft = load_hourly_foot_traffic(date)
+                _hft = _hft[(_hft["hour"] >= time_range[0]) & (_hft["hour"] < time_range[1])] if not _hft.empty else _hft
                 daily_summaries.append(
-                    build_metrics_for_llm(v, all_occ.get(date, pd.DataFrame()), all_ft.get(date, {}), date, time_range)
+                    build_metrics_for_llm(v, all_occ.get(date, pd.DataFrame()), all_ft.get(date, {}), date, time_range, hourly_foot_traffic=_hft)
                 )
             result = generate_comparison_insights(daily_summaries) if daily_summaries else ""
 
