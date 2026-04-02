@@ -38,3 +38,9 @@ def load_cached_data(date_str: str):
         foot_traffic = {"total_unique": 0, "by_type": {}}
 
     return visits, occupancy, foot_traffic
+
+
+def load_hourly_foot_traffic(date_str: str) -> pd.DataFrame:
+    """시간대별 유동인구 캐시 로드."""
+    path = CACHE_DIR / f"{date_str}_hourly_foot_traffic.parquet"
+    return pd.read_parquet(path) if path.exists() else pd.DataFrame(columns=["hour", "unique_count"])

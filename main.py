@@ -8,7 +8,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from src.data_loader import get_available_dates, load_cached_data, SWARD_MAP
+from src.data_loader import get_available_dates, load_cached_data, load_hourly_foot_traffic, SWARD_MAP
 from src.metrics import (
     compute_summary,
     compute_hourly_stats,
@@ -441,6 +441,26 @@ else:
                      labels={"date": "날짜", "duration_min": "체류 시간(분)", "restroom": ""})
         fig.update_layout(**_lay("체류 시간 분포 비교", 400))
         st.plotly_chart(fig, use_container_width=True, config=PCFG)
+
+    # ─── 날짜별 시간대 유동인구 비교 ──────────────────────
+    sh("날짜별 시간대 유동인구 비교")
+    st.caption("시간대별 화장실 앞 통행량 — 마케팅·운영 시간대 분석에 활용 가능")
+    fig_ft = go.Figure()
+    for i, date in enumerate(dates):
+        hft = load_hourly_foot_traffic(date)
+        if hft.empty:
+            continue
+        # 시간대 필터 적용
+        hft = hft[(hft["hour"] >= time_range[0]) & (hft["hour"] < time_range[1])]
+        fig_ft.add_trace(go.Scatter(
+            x=hft["hour"].apply(lambda h: f"{int(h):02d}:00"),
+            y=hft["unique_count"],
+            mode="lines+markers", name=date,
+            line=dict(color=dc[i % len(dc)], width=2),
+        ))
+    fig_ft.update_layout(**_lay("시간대별 유동인구 (Unique MAC)", 400))
+    fig_ft.update_yaxes(title_text="고유 디바이스 수")
+    st.plotly_chart(fig_ft, use_container_width=True, config=PCFG)
 
     # ─── AI Analysis (비교 모드) ──────────────────────────
     st.markdown("---")
