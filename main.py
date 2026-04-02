@@ -107,6 +107,22 @@ def make_plotly_layout(title: str = "", height: int = 400) -> dict:
     )
 
 
+# ─── 인증 ────────────────────────────────────────────────────
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+if not st.session_state.authenticated:
+    st.markdown("## 🚻 화장실 이용 모니터링")
+    st.caption("더현대서울 1F")
+    pw = st.text_input("비밀번호를 입력하세요", type="password")
+    if pw:
+        if pw == st.secrets.get("password", "wonderful2$"):
+            st.session_state.authenticated = True
+            st.rerun()
+        else:
+            st.error("비밀번호가 올바르지 않습니다.")
+    st.stop()
+
 # ─── 사이드바 ───────────────────────────────────────────────
 with st.sidebar:
     st.title("🚻 화장실 모니터링")
