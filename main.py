@@ -1,6 +1,7 @@
 """더현대서울 화장실 이용 모니터링 대시보드 (배포 버전)."""
 
 import json
+from datetime import datetime
 
 import streamlit as st
 import pandas as pd
@@ -10,17 +11,10 @@ from plotly.subplots import make_subplots
 
 from src.data_loader import get_available_dates, load_cached_data, load_hourly_foot_traffic, SWARD_MAP
 from src.metrics import (
-    compute_summary,
-    compute_hourly_stats,
-    compute_duration_distribution,
-    compute_peak_analysis,
-    compute_daily_comparison,
+    compute_summary, compute_hourly_stats, compute_duration_distribution,
+    compute_peak_analysis, compute_daily_comparison,
 )
-from src.llm_insights import (
-    generate_insights,
-    generate_comparison_insights,
-    build_metrics_for_llm,
-)
+from src.llm_insights import generate_insights, generate_comparison_insights, build_metrics_for_llm
 
 # ─── 페이지 설정 ────────────────────────────────────────────
 st.set_page_config(page_title="화장실 이용 모니터링", page_icon="🚻", layout="wide")
@@ -32,6 +26,8 @@ FEMALE_FILL = "rgba(232,93,117,0.1)"
 BG = "#0E1117"
 GRID = "#1a2035"
 PCFG = {"displayModeBar": False}
+DAY_KR = ["월", "화", "수", "목", "금", "토", "일"]
+W_ICON = {"Sunny": "☀️", "Rain": "🌧️", "Snow": "❄️", "Unknown": "🌤️"}
 
 # ─── 스타일 ──────────────────────────────────────────────────
 st.markdown("""<style>
@@ -70,6 +66,62 @@ def _ti2hm(ti: int) -> str:
     return f"{s // 3600:02d}:{(s % 3600) // 60:02d}"
 
 
+# ─── 날씨/요일 ───────────────────────────────────────────────
+@st.cache_data(show_spinner=False, ttl=86400)
+def _weather(dates: tuple[str, ...]) -> dict[str, dict]:
+    """Open-Meteo API로 요일+날씨 정보 조회 (여의도 좌표)."""
+    import ssl, urllib.request, urllib.parse
+    info = {}
+    # API 호출
+    weather_map = {}
+    try:
+        def _ctx():
+            try:
+                import certifi
+                return ssl.create_default_context(cafile=certifi.where())
+            except ImportError:
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                return ctx
+        params = {
+            "latitude": 37.5256, "longitude": 126.9286,
+            "start_date": dates[0], "end_date": dates[-1],
+            "daily": "precipitation_sum,snowfall_sum,temperature_2m_max,temperature_2m_min",
+            "timezone": "Asia/Seoul",
+        }
+        url = f"https://archive-api.open-meteo.com/v1/archive?{urllib.parse.urlencode(params)}"
+        with urllib.request.urlopen(urllib.request.Request(url), timeout=10, context=_ctx()) as resp:
+            data = json.loads(resp.read().decode())
+        daily = data.get("daily", {})
+        for i, d in enumerate(daily.get("time", [])):
+            precip = daily.get("precipitation_sum", [0])[i] or 0
+            snow = daily.get("snowfall_sum", [0])[i] or 0
+            w = "Snow" if snow > 0 else ("Rain" if precip > 0 else "Sunny")
+            weather_map[d] = {
+                "weather": w,
+                "temp_max": daily.get("temperature_2m_max", [None])[i],
+                "temp_min": daily.get("temperature_2m_min", [None])[i],
+            }
+    except Exception:
+        pass
+
+    for d in dates:
+        dt = datetime.strptime(d, "%Y-%m-%d")
+        day_kr = DAY_KR[dt.weekday()]
+        wm = weather_map.get(d, {})
+        weather = wm.get("weather", "Unknown")
+        icon = W_ICON.get(weather, "🌤️")
+        t_max, t_min = wm.get("temp_max"), wm.get("temp_min")
+        temp = f" {t_min:.0f}~{t_max:.0f}°C" if t_max is not None else ""
+        info[d] = {
+            "day_kr": day_kr, "weather": weather, "icon": icon,
+            "temp_max": t_max, "temp_min": t_min,
+            "label": f"{d} ({day_kr}) {icon}{temp}",
+        }
+    return info
+
+
 # ─── 인증 ────────────────────────────────────────────────────
 if "auth" not in st.session_state:
     st.session_state.auth = False
@@ -94,7 +146,12 @@ with st.sidebar:
     if not dates:
         st.error("데이터가 없습니다.")
         st.stop()
-    selected_date = st.selectbox("날짜 선택", dates, index=len(dates) - 1)
+
+    wi = _weather(tuple(dates))
+    date_labels = [wi[d]["label"] for d in dates]
+    sel_label = st.selectbox("날짜 선택", date_labels, index=len(dates) - 1)
+    selected_date = dates[date_labels.index(sel_label)]
+
     st.divider()
     view_mode = st.radio("분석 모드", ["일별 분석", "날짜 비교"], index=0)
     st.divider()
@@ -104,7 +161,7 @@ with st.sidebar:
     st.markdown('<div style="color:#5a6785;font-size:.75rem">S-Ward: 210002D5 (남자) / 210003C6 (여자)<br>10초 단위 BLE 감지 기반 분석</div>', unsafe_allow_html=True)
 
 
-# ─── 데이터 로드 + 시간 필터 (캐싱) ──────────────────────────
+# ─── 데이터 로드 (캐싱) ──────────────────────────────────────
 @st.cache_data(show_spinner=False)
 def _load(date_str: str):
     return load_cached_data(date_str)
@@ -132,12 +189,13 @@ def _ai(metrics_json: str) -> dict:
 if view_mode == "일별 분석":
     visits, occupancy, ft = _filter(selected_date, time_range[0], time_range[1])
 
-    st.markdown(f"## {selected_date} 화장실 이용 현황")
+    _wi = wi.get(selected_date, {})
+    _hdr = f" ({_wi.get('day_kr', '')}요일) {_wi.get('icon', '')}" if _wi else ""
+    st.markdown(f"## {selected_date}{_hdr} 화장실 이용 현황")
     if visits.empty:
         st.warning("해당 날짜/시간대에 방문 기록이 없습니다.")
         st.stop()
 
-    # 남녀 분리 (재사용)
     v_male = visits[visits["restroom"] == "남자화장실"]
     v_female = visits[visits["restroom"] == "여자화장실"]
 
@@ -367,24 +425,41 @@ if view_mode == "일별 분석":
         with st.spinner("AI가 데이터를 분석하고 있습니다..."):
             _hft = load_hourly_foot_traffic(selected_date)
             _hft = _hft[(_hft["hour"] >= time_range[0]) & (_hft["hour"] < time_range[1])] if not _hft.empty else _hft
-            llm_m = build_metrics_for_llm(visits, occupancy, ft, selected_date, time_range, hourly_foot_traffic=_hft)
+
+            # 모든 날짜 요약 (비교 맥락)
+            all_dates_summary = []
+            for d in dates:
+                if d == selected_date:
+                    continue
+                dv, _, dft = _filter(d, time_range[0], time_range[1])
+                dt = dv["mac_address"].nunique() if not dv.empty else 0
+                dft_total = dft.get("total_unique", 0) if isinstance(dft, dict) else 0
+                all_dates_summary.append({
+                    "date": d,
+                    "weather_info": wi.get(d, {}),
+                    "foot_traffic": dft_total,
+                    "total_users": dt,
+                    "usage_rate": (dt / dft_total * 100) if dft_total > 0 else 0,
+                })
+
+            llm_m = build_metrics_for_llm(
+                visits, occupancy, ft, selected_date, time_range,
+                hourly_foot_traffic=_hft,
+                weather_info=wi.get(selected_date, {}),
+                all_dates_summary=all_dates_summary,
+            )
             ai = _ai(json.dumps(llm_m, default=str))
 
         if ai:
             titles = {
-                "summary": "📊 종합 요약",
-                "gender": "🚻 남녀 이용 패턴",
-                "peak": "⏰ 피크 시간대 & 혼잡도",
-                "duration": "⏱️ 체류 시간 분석",
+                "summary": "📊 종합 요약", "gender": "🚻 남녀 이용 패턴",
+                "peak": "⏰ 피크 시간대 & 혼잡도", "duration": "⏱️ 체류 시간 분석",
                 "occupancy": "👥 동시 이용 & 용량",
             }
             for key, title in titles.items():
                 text = ai.get(key, "")
                 if text:
-                    st.markdown(
-                        f'<div class="ai"><span style="color:#64ffda;font-weight:600">{title}</span><br>{text}</div>',
-                        unsafe_allow_html=True,
-                    )
+                    st.markdown(f'<div class="ai"><span style="color:#64ffda;font-weight:600">{title}</span><br>{text}</div>', unsafe_allow_html=True)
         else:
             st.warning("AI 분석을 실행할 수 없습니다. API 키를 확인해주세요.")
 
@@ -393,12 +468,29 @@ if view_mode == "일별 분석":
 # ═══════════════════════════════════════════════════════════
 else:
     st.markdown("## 날짜별 비교 분석")
-    all_visits, all_occ, all_ft = {}, {}, {}
-    for date in dates:
+
+    # 비교 날짜 선택 (multiselect)
+    cmp_labels = [wi[d]["label"] for d in dates]
+    sel_cmp = st.multiselect(
+        "비교할 날짜 선택", cmp_labels,
+        default=cmp_labels[-3:] if len(cmp_labels) >= 3 else cmp_labels,
+    )
+    cmp_dates = [dates[cmp_labels.index(lbl)] for lbl in sel_cmp]
+
+    if not cmp_dates:
+        st.info("비교할 날짜를 선택하세요.")
+        st.stop()
+
+    all_visits, all_occ, all_ft, all_hft = {}, {}, {}, {}
+    for date in cmp_dates:
         v, o, f = _filter(date, time_range[0], time_range[1])
+        hft = load_hourly_foot_traffic(date)
+        if not hft.empty:
+            hft = hft[(hft["hour"] >= time_range[0]) & (hft["hour"] < time_range[1])]
         all_visits[date] = v
         all_occ[date] = o
         all_ft[date] = f
+        all_hft[date] = hft
 
     comparison = compute_daily_comparison(all_visits)
     if comparison.empty:
@@ -417,9 +509,11 @@ else:
     for i, (date, v) in enumerate(all_visits.items()):
         if v.empty: continue
         h = v.groupby("start_hour").size().reset_index(name="count")
+        _w = wi.get(date, {})
+        nm = f"{date}({_w.get('day_kr', '')}) {_w.get('icon', '')}"
         fig.add_trace(go.Scatter(
             x=h["start_hour"].apply(lambda x: f"{int(x):02d}:00"), y=h["count"],
-            mode="lines+markers", name=date, line=dict(color=dc[i % len(dc)], width=2)))
+            mode="lines+markers", name=nm, line=dict(color=dc[i % len(dc)], width=2)))
     fig.update_layout(**_lay("날짜별 시간대 방문 비교"))
     st.plotly_chart(fig, use_container_width=True, config=PCFG)
 
@@ -448,18 +542,14 @@ else:
     sh("날짜별 시간대 유동인구 비교")
     st.caption("시간대별 화장실 앞 통행량 — 마케팅·운영 시간대 분석에 활용 가능")
     fig_ft = go.Figure()
-    for i, date in enumerate(dates):
-        hft = load_hourly_foot_traffic(date)
-        if hft.empty:
-            continue
-        # 시간대 필터 적용
-        hft = hft[(hft["hour"] >= time_range[0]) & (hft["hour"] < time_range[1])]
+    for i, (date, hft) in enumerate(all_hft.items()):
+        if hft.empty: continue
+        _w = wi.get(date, {})
+        nm = f"{date}({_w.get('day_kr', '')}) {_w.get('icon', '')}"
         fig_ft.add_trace(go.Scatter(
             x=hft["hour"].apply(lambda h: f"{int(h):02d}:00"),
-            y=hft["unique_count"],
-            mode="lines+markers", name=date,
-            line=dict(color=dc[i % len(dc)], width=2),
-        ))
+            y=hft["unique_count"], mode="lines+markers", name=nm,
+            line=dict(color=dc[i % len(dc)], width=2)))
     fig_ft.update_layout(**_lay("시간대별 유동인구 (Unique MAC)", 400))
     fig_ft.update_yaxes(title_text="고유 디바이스 수")
     st.plotly_chart(fig_ft, use_container_width=True, config=PCFG)
@@ -474,17 +564,17 @@ else:
             daily_summaries = []
             for date, v in all_visits.items():
                 if v.empty: continue
-                _hft = load_hourly_foot_traffic(date)
-                _hft = _hft[(_hft["hour"] >= time_range[0]) & (_hft["hour"] < time_range[1])] if not _hft.empty else _hft
+                _hft = all_hft.get(date, pd.DataFrame())
                 daily_summaries.append(
-                    build_metrics_for_llm(v, all_occ.get(date, pd.DataFrame()), all_ft.get(date, {}), date, time_range, hourly_foot_traffic=_hft)
+                    build_metrics_for_llm(
+                        v, all_occ.get(date, pd.DataFrame()), all_ft.get(date, {}),
+                        date, time_range, hourly_foot_traffic=_hft,
+                        weather_info=wi.get(date, {}),
+                    )
                 )
             result = generate_comparison_insights(daily_summaries) if daily_summaries else ""
 
         if result:
-            st.markdown(
-                f'<div class="ai"><span style="color:#64ffda;font-weight:600">📊 날짜 비교 종합 분석</span><br>{result}</div>',
-                unsafe_allow_html=True,
-            )
+            st.markdown(f'<div class="ai"><span style="color:#64ffda;font-weight:600">📊 날짜 비교 종합 분석</span><br>{result}</div>', unsafe_allow_html=True)
         else:
             st.warning("AI 분석을 실행할 수 없습니다. API 키를 확인해주세요.")

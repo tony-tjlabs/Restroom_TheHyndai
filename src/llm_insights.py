@@ -17,13 +17,9 @@ MODEL = "claude-sonnet-4-20250514"
 
 
 def _format_hourly_ft(hft: dict) -> str:
-    """시간대별 유동인구 dict → 프롬프트용 텍스트."""
     if not hft:
         return "- 데이터 없음"
-    lines = []
-    for h in sorted(hft.keys()):
-        lines.append(f"  {int(h):02d}시: {hft[h]:,}명")
-    return "\n".join(lines)
+    return "\n".join(f"  {int(h):02d}시: {hft[h]:,}명" for h in sorted(hft.keys()))
 
 
 SYSTEM_PROMPT = """당신은 백화점 화장실 이용 데이터를 분석하는 시설 운영 전문가입니다.
@@ -54,15 +50,40 @@ def _get_client():
 
 
 def generate_insights(metrics: dict) -> dict[str, str]:
-    """메트릭 기반 섹션별 AI 인사이트. 실패 시 빈 dict."""
     client = _get_client()
     if client is None:
         return {}
 
+    # 요일/날씨
+    wi_data = metrics.get("weather_info", {})
+    day_str = f" ({wi_data['day_kr']}요일)" if wi_data.get("day_kr") else ""
+    weather_str = ""
+    if wi_data.get("weather") and wi_data["weather"] != "Unknown":
+        weather_str = f", 날씨: {wi_data['weather']}"
+        if wi_data.get("temp_max") is not None:
+            weather_str += f" ({wi_data['temp_min']:.0f}~{wi_data['temp_max']:.0f}°C)"
+
+    # 다른 날짜 비교 맥락
+    other_days = metrics.get("all_dates_summary", [])
+    other_block = ""
+    if other_days:
+        lines = []
+        for od in other_days:
+            owi = od.get("weather_info", {})
+            od_day = f"({owi.get('day_kr', '?')})" if owi.get("day_kr") else ""
+            od_w = f" {owi.get('weather', '')}" if owi.get("weather") and owi["weather"] != "Unknown" else ""
+            lines.append(
+                f"  {od['date']}{od_day}{od_w}: "
+                f"유동인구 {od.get('foot_traffic', 0):,}명, "
+                f"이용자 {od.get('total_users', 0):,}명, "
+                f"이용률 {od.get('usage_rate', 0):.1f}%"
+            )
+        other_block = "\n[다른 날짜 비교 데이터]\n" + "\n".join(lines) + "\n※ 위 데이터를 참고하여 오늘의 수치가 평소 대비 높은지 낮은지, 요일/날씨 영향이 있는지 분석해주세요.\n"
+
     prompt = f"""아래는 백화점 1F 화장실 하루 이용 데이터 분석 결과입니다.
 
 [기본 정보]
-- 날짜: {metrics.get('date', '?')}
+- 날짜: {metrics.get('date', '?')}{day_str}{weather_str}
 - 분석 시간대: {metrics.get('time_range', '7~23시')}
 - 유동인구: {metrics.get('foot_traffic', 0):,}명
 - 총 이용자: {metrics.get('total_users', 0):,}명 (이용률 {metrics.get('usage_rate', 0):.1f}%)
@@ -92,7 +113,7 @@ def generate_insights(metrics: dict) -> dict[str, str]:
 {_format_hourly_ft(metrics.get('hourly_foot_traffic', {}))}
 ※ 유동인구는 화장실 앞을 지나간 전체 통행량으로, 백화점 방문객의 시간대별 유입 패턴을 반영합니다.
   화장실 이용 피크와 유동인구 피크의 차이, 이용률 변화 등을 분석해주세요.
-
+{other_block}
 아래 5개 섹션에 대해 각각 1~2문장의 인사이트를 작성하세요.
 반드시 아래 형식을 지켜주세요:
 
@@ -117,25 +138,25 @@ def generate_insights(metrics: dict) -> dict[str, str]:
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
         )
-        text = resp.content[0].text
+        return _parse_sections(resp.content[0].text)
     except Exception as e:
         logger.warning(f"LLM API error: {e}")
         return {}
 
-    return _parse_sections(text)
-
 
 def generate_comparison_insights(daily_summaries: list[dict]) -> str:
-    """날짜 비교용 AI 인사이트 (단일 텍스트)."""
     client = _get_client()
     if client is None:
         return ""
 
-    lines = []
-    ft_lines = []
+    lines, ft_lines = [], []
     for d in daily_summaries:
+        wi_data = d.get("weather_info", {})
+        day_tag = f"({wi_data.get('day_kr', '?')})" if wi_data.get("day_kr") else ""
+        w_tag = f" {wi_data.get('weather', '')}" if wi_data.get("weather") and wi_data["weather"] != "Unknown" else ""
+        t_tag = f" {wi_data.get('temp_min', 0):.0f}~{wi_data.get('temp_max', 0):.0f}°C" if wi_data.get("temp_max") is not None else ""
         lines.append(
-            f"- {d.get('date', '?')}: "
+            f"- {d.get('date', '?')}{day_tag}{w_tag}{t_tag}: "
             f"유동인구 {d.get('foot_traffic', 0):,}명, "
             f"남 {d.get('male_users', 0)}명 / 여 {d.get('female_users', 0)}명, "
             f"총 {d.get('total_users', 0)}명 (이용률 {d.get('usage_rate', 0):.1f}%), "
@@ -148,16 +169,13 @@ def generate_comparison_insights(daily_summaries: list[dict]) -> str:
             top_str = ", ".join([f"{int(h):02d}시 {c:,}명" for h, c in top3])
             ft_lines.append(f"  {d.get('date', '?')} 유동인구 Top3: {top_str}")
 
-    data_block = "\n".join(lines)
-    ft_block = "\n".join(ft_lines) if ft_lines else "  데이터 없음"
-
     prompt = f"""아래는 백화점 1F 화장실의 여러 날짜 이용 데이터 요약입니다.
 
 [날짜별 이용 현황]
-{data_block}
+{chr(10).join(lines)}
 
 [시간대별 유동인구 피크 (백화점 방문 패턴)]
-{ft_block}
+{chr(10).join(ft_lines) if ft_lines else '  데이터 없음'}
 ※ 유동인구는 화장실 앞 통행량으로, 백화점 전체 방문객 유입 패턴을 반영합니다.
   날짜별 유동인구 차이와 화장실 이용률 변화의 상관관계도 분석해주세요.
 
@@ -182,15 +200,19 @@ def generate_comparison_insights(daily_summaries: list[dict]) -> str:
 def build_metrics_for_llm(
     visits, occupancy, foot_traffic, date_str, time_range,
     hourly_foot_traffic=None,
+    weather_info: dict | None = None,
+    all_dates_summary: list[dict] | None = None,
 ) -> dict:
-    """대시보드 데이터에서 LLM용 메트릭 딕셔너리 구성."""
     m = {
         "date": date_str,
         "time_range": f"{time_range[0]}~{time_range[1]}시",
         "foot_traffic": foot_traffic.get("total_unique", 0) if isinstance(foot_traffic, dict) else 0,
     }
+    if weather_info:
+        m["weather_info"] = weather_info
+    if all_dates_summary:
+        m["all_dates_summary"] = all_dates_summary
 
-    # 시간대별 유동인구
     if hourly_foot_traffic is not None:
         if isinstance(hourly_foot_traffic, pd.DataFrame) and not hourly_foot_traffic.empty:
             hft = hourly_foot_traffic.set_index("hour")["unique_count"].to_dict()
@@ -229,8 +251,7 @@ def build_metrics_for_llm(
             m[key] = int(o["device_count"].max()) if not o.empty else 0
 
     for rv, prefix in [(v_male, "male"), (v_female, "female")]:
-        if rv.empty:
-            continue
+        if rv.empty: continue
         n = len(rv)
         m[f"{prefix}_1_2min_pct"] = ((rv["duration_min"] >= 1) & (rv["duration_min"] < 2)).sum() / n * 100
         m[f"{prefix}_3_5min_pct"] = ((rv["duration_min"] >= 3) & (rv["duration_min"] < 5)).sum() / n * 100
@@ -247,7 +268,6 @@ def build_metrics_for_llm(
 
 
 def _parse_sections(text: str) -> dict[str, str]:
-    """LLM 응답에서 [SECTION] 태그로 파싱."""
     tag_map = {
         "[SUMMARY]": "summary", "[GENDER]": "gender", "[PEAK]": "peak",
         "[DURATION]": "duration", "[OCCUPANCY]": "occupancy",
@@ -255,7 +275,6 @@ def _parse_sections(text: str) -> dict[str, str]:
     sections = {}
     current_key = None
     current_lines = []
-
     for line in text.strip().split("\n"):
         line = line.strip()
         matched = False
@@ -268,7 +287,6 @@ def _parse_sections(text: str) -> dict[str, str]:
                 break
         if not matched and line and current_key:
             current_lines.append(line)
-
     if current_key:
         sections[current_key] = " ".join(current_lines).strip()
     return sections
