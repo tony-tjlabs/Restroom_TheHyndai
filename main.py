@@ -508,13 +508,17 @@ else:
     dc = px.colors.qualitative.Set2
     for i, (date, v) in enumerate(all_visits.items()):
         if v.empty: continue
-        h = v.groupby("start_hour").size().reset_index(name="count")
+        h = v.groupby("start_hour").size().reset_index(name="count").sort_values("start_hour")
         _w = wi.get(date, {})
         nm = f"{date}({_w.get('day_kr', '')}) {_w.get('icon', '')}"
         fig.add_trace(go.Scatter(
-            x=h["start_hour"].apply(lambda x: f"{int(x):02d}:00"), y=h["count"],
-            mode="lines+markers", name=nm, line=dict(color=dc[i % len(dc)], width=2)))
+            x=h["start_hour"], y=h["count"],
+            mode="lines+markers", name=nm, line=dict(color=dc[i % len(dc)], width=2),
+            hovertemplate="%{x:02d}:00 | %{y}회<extra>%{fullData.name}</extra>"))
+    tv = list(range(time_range[0], time_range[1] + 1))
+    tt = [f"{h:02d}:00" for h in tv]
     fig.update_layout(**_lay("날짜별 시간대 방문 비교"))
+    fig.update_xaxes(tickmode="array", tickvals=tv, ticktext=tt)
     st.plotly_chart(fig, use_container_width=True, config=PCFG)
 
     sh("날짜별 남녀 방문 비율")
@@ -544,13 +548,16 @@ else:
     fig_ft = go.Figure()
     for i, (date, hft) in enumerate(all_hft.items()):
         if hft.empty: continue
+        hft_s = hft.sort_values("hour")
         _w = wi.get(date, {})
         nm = f"{date}({_w.get('day_kr', '')}) {_w.get('icon', '')}"
         fig_ft.add_trace(go.Scatter(
-            x=hft["hour"].apply(lambda h: f"{int(h):02d}:00"),
-            y=hft["unique_count"], mode="lines+markers", name=nm,
-            line=dict(color=dc[i % len(dc)], width=2)))
+            x=hft_s["hour"], y=hft_s["unique_count"],
+            mode="lines+markers", name=nm,
+            line=dict(color=dc[i % len(dc)], width=2),
+            hovertemplate="%{x:02d}:00 | %{y:,}명<extra>%{fullData.name}</extra>"))
     fig_ft.update_layout(**_lay("시간대별 유동인구 (Unique MAC)", 400))
+    fig_ft.update_xaxes(tickmode="array", tickvals=tv, ticktext=tt)
     fig_ft.update_yaxes(title_text="고유 디바이스 수")
     st.plotly_chart(fig_ft, use_container_width=True, config=PCFG)
 
