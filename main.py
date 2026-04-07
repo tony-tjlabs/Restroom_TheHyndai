@@ -426,7 +426,7 @@ if view_mode == "일별 분석":
             _hft = load_hourly_foot_traffic(selected_date)
             _hft = _hft[(_hft["hour"] >= time_range[0]) & (_hft["hour"] < time_range[1])] if not _hft.empty else _hft
 
-            # 모든 날짜 요약 (비교 맥락)
+            # 모든 날짜 상세 요약 (비교 맥락)
             all_dates_summary = []
             for d in dates:
                 if d == selected_date:
@@ -434,12 +434,21 @@ if view_mode == "일별 분석":
                 dv, _, dft = _filter(d, time_range[0], time_range[1])
                 dt = dv["mac_address"].nunique() if not dv.empty else 0
                 dft_total = dft.get("total_unique", 0) if isinstance(dft, dict) else 0
+                d_male = dv[dv["restroom"] == "남자화장실"] if not dv.empty else dv
+                d_female = dv[dv["restroom"] == "여자화장실"] if not dv.empty else dv
+                d_hourly = dv.groupby("start_hour").size() if not dv.empty else pd.Series(dtype=int)
                 all_dates_summary.append({
                     "date": d,
                     "weather_info": wi.get(d, {}),
                     "foot_traffic": dft_total,
                     "total_users": dt,
                     "usage_rate": (dt / dft_total * 100) if dft_total > 0 else 0,
+                    "male_users": d_male["mac_address"].nunique() if not d_male.empty else 0,
+                    "female_users": d_female["mac_address"].nunique() if not d_female.empty else 0,
+                    "male_avg_min": float(d_male["duration_min"].mean()) if not d_male.empty else 0,
+                    "female_avg_min": float(d_female["duration_min"].mean()) if not d_female.empty else 0,
+                    "peak_hour": int(d_hourly.idxmax()) if not d_hourly.empty else 0,
+                    "peak_visits": int(d_hourly.max()) if not d_hourly.empty else 0,
                 })
 
             llm_m = build_metrics_for_llm(
