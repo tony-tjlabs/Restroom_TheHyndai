@@ -14,7 +14,11 @@ from src.metrics import (
     compute_summary, compute_hourly_stats, compute_duration_distribution,
     compute_peak_analysis, compute_daily_comparison,
 )
-from src.llm_insights import generate_insights, generate_comparison_insights, build_metrics_for_llm
+from src.llm_insights import (
+    generate_insights_streaming,
+    generate_comparison_insights_streaming,
+    build_metrics_for_llm,
+)
 
 # ─── 페이지 설정 ────────────────────────────────────────────
 st.set_page_config(page_title="화장실 이용 모니터링", page_icon="🚻", layout="wide")
@@ -178,9 +182,11 @@ def _filter(date_str: str, t0: int, t1: int):
     return visits, occ, ft
 
 
-@st.cache_data(show_spinner=False, ttl=3600)
-def _ai(metrics_json: str) -> dict:
-    return generate_insights(json.loads(metrics_json))
+def _render_ai_sections(sections: dict, section_titles: dict):
+    for key, title in section_titles.items():
+        text = sections.get(key, "")
+        if text:
+            st.markdown(f'<div class="ai"><span style="color:#64ffda;font-weight:600">{title}</span><br>{text}</div>', unsafe_allow_html=True)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -419,14 +425,29 @@ if view_mode == "일별 분석":
     # ─── AI Analysis ──────────────────────────────────────
     st.markdown("---")
     sh("🤖 AI Analysis")
-    st.caption("Claude AI가 오늘의 화장실 이용 데이터를 종합 분석합니다.")
+    st.caption("Claude AI가 오늘의 화장실 이용 데이터를 종합 분석합니다. (요일 기대값 · 시간대별 이용률 · 청소 권장 포함)")
 
-    if st.button("AI 분석 실행", type="primary", use_container_width=True):
-        with st.spinner("AI가 데이터를 분석하고 있습니다..."):
+    _ai_cache_key = f"ai_daily_{selected_date}_{time_range[0]}_{time_range[1]}"
+
+    DAILY_SECTION_TITLES = {
+        "summary":   "📊 종합 요약",
+        "gender":    "🚻 남녀 이용 패턴",
+        "peak":      "⏰ 피크 시간대 & 혼잡도",
+        "duration":  "⏱️ 체류 시간 분석",
+        "occupancy": "👥 동시 이용 & 용량",
+        "cleaning":  "🧹 청소 · 운영 권장",
+    }
+
+    if _ai_cache_key in st.session_state:
+        _render_ai_sections(st.session_state[_ai_cache_key], DAILY_SECTION_TITLES)
+        if st.button("AI 재분석", use_container_width=True):
+            del st.session_state[_ai_cache_key]
+            st.rerun()
+    else:
+        if st.button("AI 분석 실행", type="primary", use_container_width=True):
             _hft = load_hourly_foot_traffic(selected_date)
             _hft = _hft[(_hft["hour"] >= time_range[0]) & (_hft["hour"] < time_range[1])] if not _hft.empty else _hft
 
-            # 모든 날짜 상세 요약 (비교 맥락)
             all_dates_summary = []
             for d in dates:
                 if d == selected_date:
@@ -438,10 +459,8 @@ if view_mode == "일별 분석":
                 d_female = dv[dv["restroom"] == "여자화장실"] if not dv.empty else dv
                 d_hourly = dv.groupby("start_hour").size() if not dv.empty else pd.Series(dtype=int)
                 all_dates_summary.append({
-                    "date": d,
-                    "weather_info": wi.get(d, {}),
-                    "foot_traffic": dft_total,
-                    "total_users": dt,
+                    "date": d, "weather_info": wi.get(d, {}),
+                    "foot_traffic": dft_total, "total_users": dt,
                     "usage_rate": (dt / dft_total * 100) if dft_total > 0 else 0,
                     "male_users": d_male["mac_address"].nunique() if not d_male.empty else 0,
                     "female_users": d_female["mac_address"].nunique() if not d_female.empty else 0,
@@ -457,20 +476,22 @@ if view_mode == "일별 분석":
                 weather_info=wi.get(selected_date, {}),
                 all_dates_summary=all_dates_summary,
             )
-            ai = _ai(json.dumps(llm_m, default=str))
 
-        if ai:
-            titles = {
-                "summary": "📊 종합 요약", "gender": "🚻 남녀 이용 패턴",
-                "peak": "⏰ 피크 시간대 & 혼잡도", "duration": "⏱️ 체류 시간 분석",
-                "occupancy": "👥 동시 이용 & 용량",
-            }
-            for key, title in titles.items():
-                text = ai.get(key, "")
-                if text:
-                    st.markdown(f'<div class="ai"><span style="color:#64ffda;font-weight:600">{title}</span><br>{text}</div>', unsafe_allow_html=True)
-        else:
-            st.warning("AI 분석을 실행할 수 없습니다. API 키를 확인해주세요.")
+            _stream_ph = st.empty()
+            def _on_chunk(text_so_far: str):
+                _stream_ph.markdown(
+                    f'<div class="ai" style="white-space:pre-wrap;">{text_so_far}▌</div>',
+                    unsafe_allow_html=True,
+                )
+
+            ai = generate_insights_streaming(llm_m, _on_chunk)
+            _stream_ph.empty()
+
+            if ai:
+                st.session_state[_ai_cache_key] = ai
+                _render_ai_sections(ai, DAILY_SECTION_TITLES)
+            else:
+                st.warning("AI 분석을 실행할 수 없습니다. API 키를 확인해주세요.")
 
 # ═══════════════════════════════════════════════════════════
 #  날짜 비교 모드
@@ -573,13 +594,28 @@ else:
     # ─── AI Analysis (비교 모드) ──────────────────────────
     st.markdown("---")
     sh("🤖 AI Analysis")
-    st.caption("Claude AI가 날짜 간 이용 패턴 변화를 분석합니다.")
+    st.caption("Claude AI가 날짜 간 이용 패턴 변화를 분석합니다. (추세 · 패턴 · 이상 날짜 · 운영 제안)")
 
-    if st.button("AI 비교 분석 실행", type="primary", use_container_width=True):
-        with st.spinner("AI가 데이터를 분석하고 있습니다..."):
+    COMP_SECTION_TITLES = {
+        "trend":   "📈 이용 추세",
+        "pattern": "🗓️ 요일 · 시간대 패턴",
+        "anomaly": "⚠️ 특이 날짜",
+        "action":  "🧹 운영 개선 제안",
+    }
+
+    _comp_cache_key = f"ai_comp_{'_'.join(sorted(cmp_dates))}_{time_range[0]}_{time_range[1]}"
+
+    if _comp_cache_key in st.session_state:
+        _render_ai_sections(st.session_state[_comp_cache_key], COMP_SECTION_TITLES)
+        if st.button("AI 재분석", key="comp_rerun", use_container_width=True):
+            del st.session_state[_comp_cache_key]
+            st.rerun()
+    else:
+        if st.button("AI 비교 분석 실행", type="primary", use_container_width=True):
             daily_summaries = []
             for date, v in all_visits.items():
-                if v.empty: continue
+                if v.empty:
+                    continue
                 _hft = all_hft.get(date, pd.DataFrame())
                 daily_summaries.append(
                     build_metrics_for_llm(
@@ -588,9 +624,22 @@ else:
                         weather_info=wi.get(date, {}),
                     )
                 )
-            result = generate_comparison_insights(daily_summaries) if daily_summaries else ""
 
-        if result:
-            st.markdown(f'<div class="ai"><span style="color:#64ffda;font-weight:600">📊 날짜 비교 종합 분석</span><br>{result}</div>', unsafe_allow_html=True)
-        else:
-            st.warning("AI 분석을 실행할 수 없습니다. API 키를 확인해주세요.")
+            if not daily_summaries:
+                st.warning("비교할 데이터가 없습니다.")
+            else:
+                _comp_ph = st.empty()
+                def _on_comp_chunk(text_so_far: str):
+                    _comp_ph.markdown(
+                        f'<div class="ai" style="white-space:pre-wrap;">{text_so_far}▌</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                result = generate_comparison_insights_streaming(daily_summaries, _on_comp_chunk)
+                _comp_ph.empty()
+
+                if result:
+                    st.session_state[_comp_cache_key] = result
+                    _render_ai_sections(result, COMP_SECTION_TITLES)
+                else:
+                    st.warning("AI 분석을 실행할 수 없습니다. API 키를 확인해주세요.")
